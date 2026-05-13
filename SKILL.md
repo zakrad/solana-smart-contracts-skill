@@ -1687,3 +1687,916 @@ solana program show <PROGRAM_ID>
 | SLOAD/SSTORE | Per-slot reads/writes | Account borrows (safe: one writer) |
 | View functions | `view` modifier | No — structural (not in Context = not accessible) |
 | msg.value | Implicit in `payable` | Must CPI to System Program |
+
+---
+
+## 28. Token Sale — Full Tutorial
+
+Complete pattern: users pay SOL, receive SPL tokens. Program holds SOL in treasury PDA; tokens minted by program-controlled mint PDA.
+
+### Account Structure
+```rust
+#[account]
+pub struct AdminConfig {
+    pub admin: Pubkey,         // authorized withdrawal address
+    pub mint: Pubkey,          // token mint address
+    pub treasury: Pubkey,      // SOL vault PDA
+    pub total_raised: u64,     // cumulative SOL received
+}
+```
+
+### Constants
+```rust
+const TOKENS_PER_SOL: u64 = 100;
+const SUPPLY_CAP: u64 = 1_000_000_000_000_000; // 1M tokens × 10^9 decimals
+```
+
+### Initialize (creates mint + treasury + config)
+```rust
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(
+        init, payer = signer,
+        space = 8 + size_of::<AdminConfig>(),
+        seeds = [b"admin_config"], bump
+    )]
+    pub admin_config: Account<'info, AdminConfig>,
+
+    #[account(
+        init, payer = signer,
+        mint::decimals = 9,
+        mint::authority = mint,        // self-referential PDA authority
+        seeds = [b"token_mint"], bump
+    )]
+    pub mint: Account<'info, Mint>,
+
+    #[account(
+        init, payer = signer, space = 0,
+        seeds = [b"treasury"], bump
+    )]
+    pub treasury: SystemAccount<'info>,
+
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    let cfg = &mut ctx.accounts.admin_config;
+    cfg.admin = ctx.accounts.signer.key();
+    cfg.mint = ctx.accounts.mint.key();
+    cfg.treasury = ctx.accounts.treasury.key();
+    cfg.total_raised = 0;
+    Ok(())
+}
+```
+
+### Buy Tokens (SOL in → tokens out)
+```rust
+pub fn buy_tokens(ctx: Context<BuyTokens>, sol_amount: u64) -> Result<()> {
+    // 1. Calculate tokens to mint (with overflow check)
+    let token_amount = sol_amount
+        .checked_mul(TOKENS_PER_SOL).unwrap()
+        .checked_mul(10u64.pow(9)).unwrap(); // adjust for decimals
+
+    // 2. Validate supply cap
+    let new_supply = ctx.accounts.mint.supply.checked_add(token_amount).unwrap();
+    require!(new_supply <= SUPPLY_CAP, MyError::SupplyCapExceeded);
+
+    // 3. Transfer SOL to treasury via System Program CPI
+    system_program::transfer(
+        CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: ctx.accounts.buyer.to_account_info(),
+                to: ctx.accounts.treasury.to_account_info(),
+            },
+        ),
+        sol_amount,
+    )?;
+
+    // 4. Mint tokens — program signs with mint PDA seeds
+    let bump = ctx.bumps.mint;
+    let seeds: &[&[&[u8]]] = &[&[b"token_mint", &[bump]]];
+    token::mint_to(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            MintTo {
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.buyer_ata.to_account_info(),
+                authority: ctx.accounts.mint.to_account_info(),
+            },
+            seeds,
+        ),
+        token_amount,
+    )?;
+
+    ctx.accounts.admin_config.total_raised =
+        ctx.accounts.admin_config.total_raised.checked_add(sol_amount).unwrap();
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct BuyTokens<'info> {
+    #[account(mut, seeds = [b"admin_config"], bump)]
+    pub admin_config: Account<'info, AdminConfig>,
+    #[account(mut, seeds = [b"token_mint"], bump)]
+    pub mint: Account<'info, Mint>,
+    #[account(mut, seeds = [b"treasury"], bump)]
+    pub treasury: SystemAccount<'info>,
+    #[account(mut, token::mint = mint, token::authority = buyer)]
+    pub buyer_ata: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+```
+
+### Admin Withdraw SOL from Treasury
+```rust
+pub fn withdraw_sol(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+    require!(
+        ctx.accounts.admin_config.admin == ctx.accounts.admin.key(),
+        MyError::NotAdmin
+    );
+    let bump = ctx.bumps.treasury;
+    let seeds: &[&[&[u8]]] = &[&[b"treasury", &[bump]]];
+    system_program::transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::Transfer {
+                from: ctx.accounts.treasury.to_account_info(),
+                to: ctx.accounts.admin.to_account_info(),
+            },
+            seeds,
+        ),
+        amount,
+    )?;
+    Ok(())
+}
+```
+
+### Rules
+- ATA must exist before `buy_tokens` — create with `create_associated_token_account_idempotent` client-side
+- `mint::authority = mint` (self-referential) means the mint PDA is its own authority; program signs for it
+- Supply cap check MUST happen before minting, not after
+- Use `checked_mul` for all token arithmetic — overflow here is a critical security bug
+
+---
+
+## 29. Token Bank — Full Tutorial
+
+Bank that holds SPL tokens on behalf of users. Each user has a dedicated PDA that tracks their deposited balance.
+
+### Account Structure
+```rust
+#[account]
+pub struct UserTokenAccount {
+    pub owner: Pubkey,      // the depositor
+    pub deposited: u64,     // tracked balance (NOT the ATA balance)
+}
+```
+
+### Initialize User Bank Account
+```rust
+#[derive(Accounts)]
+pub struct InitUserAccount<'info> {
+    #[account(
+        init, payer = signer,
+        space = 8 + size_of::<UserTokenAccount>(),
+        seeds = [b"user-account", signer.key().as_ref()],
+        bump
+    )]
+    pub user_account: Account<'info, UserTokenAccount>,
+    #[account(mut)]
+    pub signer: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn init_user_account(ctx: Context<InitUserAccount>) -> Result<()> {
+    ctx.accounts.user_account.owner = ctx.accounts.signer.key();
+    ctx.accounts.user_account.deposited = 0;
+    Ok(())
+}
+```
+
+### Deposit Tokens
+```rust
+pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+    require!(ctx.accounts.user_account.owner == ctx.accounts.signer.key(), MyError::Unauthorized);
+
+    token::transfer(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.user_ata.to_account_info(),
+                to: ctx.accounts.bank_ata.to_account_info(),
+                authority: ctx.accounts.signer.to_account_info(),
+            },
+        ),
+        amount,
+    )?;
+
+    ctx.accounts.user_account.deposited =
+        ctx.accounts.user_account.deposited.checked_add(amount).unwrap();
+    Ok(())
+}
+```
+
+### Withdraw Tokens (Bank ATA → User ATA, signed by bank PDA)
+```rust
+pub fn withdraw(ctx: Context<WithdrawTokens>, amount: u64) -> Result<()> {
+    require!(ctx.accounts.user_account.owner == ctx.accounts.signer.key(), MyError::Unauthorized);
+    require!(ctx.accounts.user_account.deposited >= amount, MyError::InsufficientBalance);
+
+    let bump = ctx.bumps.bank_authority;
+    let seeds: &[&[&[u8]]] = &[&[b"bank-authority", &[bump]]];
+    token::transfer(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.bank_ata.to_account_info(),
+                to: ctx.accounts.user_ata.to_account_info(),
+                authority: ctx.accounts.bank_authority.to_account_info(),
+            },
+            seeds,
+        ),
+        amount,
+    )?;
+
+    ctx.accounts.user_account.deposited =
+        ctx.accounts.user_account.deposited.checked_sub(amount).unwrap();
+    Ok(())
+}
+```
+
+### SOL Bank with Rent Preservation
+```rust
+pub fn withdraw_sol(ctx: Context<WithdrawSol>, amount: u64) -> Result<()> {
+    let rent = Rent::get()?;
+    let min_balance = rent.minimum_balance(ctx.accounts.bank_account.data_len());
+
+    // CRITICAL: never drain below rent-exempt minimum or account gets deleted
+    let available = ctx.accounts.bank_account.lamports()
+        .checked_sub(min_balance).unwrap();
+    require!(available >= amount, MyError::InsufficientFunds);
+
+    **ctx.accounts.bank_account.to_account_info().try_borrow_mut_lamports()? -= amount;
+    **ctx.accounts.signer.to_account_info().try_borrow_mut_lamports()? += amount;
+    Ok(())
+}
+```
+
+### Rules
+- Track balance in `UserTokenAccount.deposited`, NOT by reading the ATA balance (ATA can receive tokens externally)
+- Preserve rent-exempt minimum when withdrawing SOL — accounts below threshold get garbage-collected
+- Bank ATA authority must be a PDA the program controls, not a user key
+- Always validate `user_account.owner == signer` on every write instruction
+
+---
+
+## 30. Interest-Bearing Token — Deep Math
+
+### On-Chain vs Display Balance
+Balances stored on-chain are **raw principal only**. Interest accrual is a view-only calculation applied at display time by wallets/UIs. The `amount` field in the token account never changes from interest.
+
+### Continuous Compounding Formula
+```
+A = P × e^(rt)
+
+Where:
+  P = principal (raw on-chain amount)
+  r = annual rate as decimal (500 bps = 0.05)
+  t = elapsed time in years = elapsed_seconds / SECONDS_PER_YEAR
+  SECONDS_PER_YEAR = 31,556,736
+
+Example: 1000 tokens at 5% for 2 years:
+  A = 1000 × e^(0.05 × 2) = 1000 × e^0.10 = 1105.17 tokens displayed
+```
+
+### Rate Change — Time-Weighted Average
+When the rate changes, the effective average rate across the entire period is:
+```
+new_avg_rate = (r1 × t1 + r2 × t2) / (t1 + t2)
+
+Where t1 = time at old rate, t2 = time at new rate
+
+This is stored as: pre_update_average_rate in InterestBearingConfig
+```
+
+### InterestBearingConfig Fields
+```rust
+// Stored inside the mint account's TLV extension data
+pub struct InterestBearingConfig {
+    pub rate_authority: OptionalNonZeroPubkey,  // all zeros = immutable rate
+    pub initialization_timestamp: UnixTimestamp, // when the clock started
+    pub pre_update_average_rate: i16,            // bps, time-weighted average
+    pub last_update_timestamp: UnixTimestamp,    // when rate last changed
+    pub current_rate: i16,                       // bps, current rate
+}
+```
+
+### Computing Display Amount Off-Chain
+```typescript
+import { getInterestBearingMintConfigState, amountToUiAmountForMintWithoutSimulation } from "@solana/spl-token";
+
+const mintInfo = await getMint(connection, mintAddress, "confirmed", TOKEN_2022_PROGRAM_ID);
+const interestConfig = getInterestBearingMintConfigState(mintInfo);
+const currentTimestamp = Math.floor(Date.now() / 1000);
+
+// Calculate accrued amount
+const displayAmount = amountToUiAmountForMintWithoutSimulation(
+    rawAmount,
+    mintInfo.decimals,
+    interestConfig,
+    currentTimestamp
+);
+```
+
+### Update Rate (requires rate_authority signature)
+```rust
+pub fn update_rate(ctx: Context<UpdateRate>, new_rate_bps: i16) -> Result<()> {
+    interest_bearing_mint_update_rate(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            InterestBearingMintUpdateRate {
+                token_program_id: ctx.accounts.token_program.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                rate_authority: ctx.accounts.rate_authority.to_account_info(),
+            },
+        ),
+        new_rate_bps,
+    )?;
+    Ok(())
+}
+```
+
+### Rules
+- Negative rates are valid (deflationary tokens)
+- `rate_authority = Pubkey::default()` (all zeros) makes the rate permanently immutable
+- Wallets MUST implement display logic; without it users see raw principal with no interest shown
+- Round only at the final display step to avoid cumulative precision loss
+- Basis points: 10000 bps = 100%, 500 bps = 5%, -100 bps = -1%
+
+---
+
+## 31. Token-2022 — Manual Mint Creation (Full Pattern)
+
+Anchor's `#[account(init)]` cannot handle Token-2022 extension sizing. You must create the account manually in three explicit steps.
+
+### Full Three-Step Pattern
+```rust
+#[derive(Accounts)]
+pub struct CreateInterestBearingMint<'info> {
+    #[account(mut)]
+    pub mint: Signer<'info>,           // new keypair for mint account
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub rent: Sysvar<'info, Rent>,
+    pub system_program: Program<'info, System>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+pub fn create_interest_bearing_mint(
+    ctx: Context<CreateInterestBearingMint>,
+    rate_bps: i16,
+    decimals: u8,
+) -> Result<()> {
+    // Step 1: Calculate exact account size including extension
+    let mint_size = ExtensionType::try_calculate_account_len::<PodMint>(
+        &[ExtensionType::InterestBearingConfig]
+    )?;
+
+    // Step 2: Create the account (allocate space, assign to Token2022 program)
+    let lamports = ctx.accounts.rent.minimum_balance(mint_size);
+    system_program::create_account(
+        CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            system_program::CreateAccount {
+                from: ctx.accounts.payer.to_account_info(),
+                to: ctx.accounts.mint.to_account_info(),
+            },
+        ),
+        lamports,
+        mint_size as u64,
+        &ctx.accounts.token_program.key(),
+    )?;
+
+    // Step 3a: Initialize extension BEFORE base mint (ORDER IS CRITICAL)
+    interest_bearing_mint_initialize(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            InterestBearingMintInitialize {
+                token_program_id: ctx.accounts.token_program.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+            },
+        ),
+        Some(ctx.accounts.payer.key()),  // rate authority
+        rate_bps,
+    )?;
+
+    // Step 3b: Initialize base mint AFTER extension
+    anchor_spl::token_interface::initialize_mint2(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            anchor_spl::token_interface::InitializeMint2 {
+                mint: ctx.accounts.mint.to_account_info(),
+            },
+        ),
+        decimals,
+        &ctx.accounts.payer.key(),
+        Some(&ctx.accounts.payer.key()),
+    )?;
+
+    Ok(())
+}
+```
+
+### Token-2022 vs SPL Token Account Wrappers
+```rust
+// Legacy SPL Token
+pub token_program: Program<'info, Token>,
+pub mint: Account<'info, Mint>,
+pub token_account: Account<'info, TokenAccount>,
+
+// Token-2022 (or either program)
+pub token_program: Interface<'info, TokenInterface>,
+pub mint: InterfaceAccount<'info, Mint>,
+pub token_account: InterfaceAccount<'info, TokenAccount>,
+```
+
+### ATA Creation for Token-2022
+```rust
+// Token-2022 ATAs have ImmutableOwner extension by default
+// Use token_2022 program ID when creating ATAs
+use spl_associated_token_account::instruction::create_associated_token_account;
+let ix = create_associated_token_account(
+    &payer,
+    &owner,
+    &mint,
+    &spl_token_2022::ID,  // NOT spl_token::ID
+);
+```
+
+---
+
+## 32. Heap and Panic Handler Internals
+
+### Heap Layout
+```
+MM_HEAP_START = 0x300000000
+Size:           32,768 bytes (32 KB)
+Allocator:      Bump allocator (never frees within a single execution)
+Reset:          Full reset after every program execution
+```
+
+The bump allocator moves a pointer forward on each allocation and never reclaims memory. There is no `free()` — the entire 32KB resets when execution ends.
+
+### Exceeding 32KB Heap
+- Allocation request exceeding available space → returns null pointer
+- No panic, no exception — just a null pointer returned
+- Subsequent dereference → segfault / undefined behavior
+- Mitigation: avoid large `Vec` allocations; prefer stack-allocated fixed arrays
+
+### Custom Panic Handler (`entrypoint!` macro sets this up)
+```rust
+// What entrypoint! generates (simplified):
+#[no_mangle]
+pub unsafe extern "C" fn entrypoint(input: *mut u8) -> u64 {
+    // 1. Set up custom heap allocator at MM_HEAP_START
+    // 2. Set up custom panic handler that calls __log + __panic syscalls
+    // 3. Deserialize input
+    // 4. Call process_instruction(program_id, accounts, data)
+    // 5. Return 0 (success) or 1 (error)
+}
+```
+
+### Binary Size Impact
+The custom panic handler adds ~25KB to the compiled `.so` binary. For size-sensitive programs:
+```toml
+# Cargo.toml — disable default panic handler
+[features]
+custom-heap = []
+custom-panic = []
+
+[profile.release]
+opt-level = "z"         # optimize for size
+strip = "symbols"       # remove debug symbols
+```
+
+### Rust's `no_std` in Solana
+Solana programs run in a `no_std` environment — no OS, no standard file I/O, no threading. The `solana-program` crate provides replacements:
+- `msg!` instead of `println!`
+- `solana_program::log::sol_log` instead of `eprintln!`
+- Custom allocator instead of system `malloc`
+
+---
+
+## 33. Compute Unit Tracing with `agave-ledger-tool`
+
+### Setup
+```bash
+# Build program
+anchor build
+# or for native:
+cargo build-sbf --tools-version v1.52
+
+# Generate trace
+agave-ledger-tool program run \
+  target/deploy/my_program.so \
+  --limit 200000 \
+  --trace trace.txt \
+  --ledger test-ledger \
+  --input instructions.json
+
+# Apple Silicon (requires interpreter mode):
+agave-ledger-tool program run \
+  target/deploy/my_program.so \
+  --limit 200000 \
+  --trace trace.txt \
+  --ledger test-ledger \
+  --input instructions.json \
+  --mode interpreter
+```
+
+### `instructions.json` Format
+```json
+{
+  "accounts": [],
+  "program_id": "YOUR_PROGRAM_ID_HERE",
+  "instruction_data": [175, 175, 109, 31, 13, 152, 155, 237]
+}
+```
+
+The `instruction_data` array contains the 8-byte Anchor discriminator for the function you want to trace. To get the discriminator:
+```bash
+# Compute discriminator = sha256("global:function_name")[0..8]
+node -e "
+const crypto = require('crypto');
+const hash = crypto.createHash('sha256').update('global:initialize').digest();
+console.log([...hash.slice(0, 8)]);
+"
+```
+
+### Reading the Trace Output
+```
+# trace.txt format:
+# instruction_count | opcode | dst_reg | src_reg | offset | imm | registers
+0: mov64 r1, 0x400000000    ; R1 = input pointer
+1: mov64 r10, 0x200001000   ; R10 = frame pointer (stack base)
+...
+171: exit                    ; program complete
+# execution count = 172 instructions (0-indexed, so count is n+1)
+```
+
+### CU Formula from Trace
+```
+Total CU = trace_line_count + syscall_overhead
+         = (last_line_number + 1) + (num_syscalls × syscall_cost)
+
+Example: trace ends at line 171, 2 msg! calls:
+  CU = 172 + (2 × 100) = 372 CU
+```
+
+### Viewing LLVM IR
+```bash
+RUSTFLAGS="-C debuginfo=0 --emit=llvm-ir" cargo build
+# IR file created in target/debug/deps/*.ll
+
+# View SBF disassembly directly:
+cargo build-sbf --dump
+# Creates target/deploy/my_program-dump.txt
+```
+
+### Anchor Discriminator Overhead
+Every Anchor instruction automatically logs its name on entry:
+```
+Program log: Instruction: Initialize   ← costs ~100 CU
+```
+This is injected by the `#[program]` macro and cannot be disabled without modifying Anchor.
+
+---
+
+## 34. sBPF Instruction Set — Full Reference
+
+### Instruction Encoding (8 bytes per instruction)
+```
+Byte 0:   opcode
+Byte 0.5: destination register (high nibble of byte 0)
+Byte 0.5: source register (low nibble of byte 0 — wait, see below)
+
+Actual layout (little-endian 64-bit word):
+  bits 0-7:   opcode
+  bits 8-11:  destination register (0-10)
+  bits 12-15: source register (0-10)
+  bits 16-31: signed 16-bit offset
+  bits 32-63: signed 32-bit immediate
+```
+
+### Load Instructions (memory → register)
+| Instruction | Size | Description |
+|---|---|---|
+| `ldxdw r_dst, [r_src + off]` | 8 bytes | Load 64-bit doubleword |
+| `ldxw  r_dst, [r_src + off]` | 4 bytes | Load 32-bit word (zero-extends) |
+| `ldxh  r_dst, [r_src + off]` | 2 bytes | Load 16-bit halfword (zero-extends) |
+| `ldxb  r_dst, [r_src + off]` | 1 byte  | Load 8-bit byte (zero-extends) |
+| `lddw  r_dst, imm64`         | 16 bytes | Load 64-bit immediate (2 instructions) |
+
+### Store Instructions (register → memory)
+| Instruction | Size | Description |
+|---|---|---|
+| `stxdw [r_dst + off], r_src` | 8 bytes | Store 64-bit |
+| `stxw  [r_dst + off], r_src` | 4 bytes | Store 32-bit |
+| `stxh  [r_dst + off], r_src` | 2 bytes | Store 16-bit |
+| `stxb  [r_dst + off], r_src` | 1 byte  | Store 8-bit |
+
+### Arithmetic Instructions
+```asm
+add64 r0, r1       ; r0 += r1 (64-bit)
+add32 r0, r1       ; r0 += r1 (32-bit, zero-extend result)
+add64 r0, 42       ; r0 += immediate
+sub64 r0, r1       ; r0 -= r1
+mul64 r0, r1       ; r0 *= r1
+div64 r0, r1       ; r0 /= r1 (unsigned)
+mod64 r0, r1       ; r0 %= r1
+and64 r0, r1       ; r0 &= r1
+or64  r0, r1       ; r0 |= r1
+xor64 r0, r1       ; r0 ^= r1
+lsh64 r0, r1       ; r0 <<= r1
+rsh64 r0, r1       ; r0 >>= r1 (logical)
+arsh64 r0, r1      ; r0 >>= r1 (arithmetic, sign-extends)
+neg64 r0           ; r0 = -r0
+mov64 r0, r1       ; r0 = r1
+```
+
+### Control Flow
+```asm
+ja   +offset       ; unconditional jump (relative)
+jeq  r0, r1, +off  ; jump if r0 == r1
+jne  r0, r1, +off  ; jump if r0 != r1
+jlt  r0, r1, +off  ; jump if r0 < r1  (unsigned)
+jle  r0, r1, +off  ; jump if r0 <= r1 (unsigned)
+jgt  r0, r1, +off  ; jump if r0 > r1  (unsigned)
+jge  r0, r1, +off  ; jump if r0 >= r1 (unsigned)
+jslt r0, r1, +off  ; jump if r0 < r1  (signed)
+jsle r0, r1, +off  ; jump if r0 <= r1 (signed)
+jsgt r0, r1, +off  ; jump if r0 > r1  (signed)
+jsge r0, r1, +off  ; jump if r0 >= r1 (signed)
+call imm           ; call internal function (relative)
+syscall imm        ; call Solana syscall by name hash
+exit               ; return R0 to caller (0 = success, non-zero = error)
+```
+
+### Register Calling Convention
+```
+On function ENTRY:
+  R1–R5: arguments (first 5 params)
+  R6–R9: callee must preserve (save to stack, restore before return)
+  R10:   read-only frame pointer (writes silently ignored)
+  R0:    undefined on entry, holds return value on exit
+
+Standard function prologue/epilogue:
+  prologue: stxdw [r10-8], r6   ; save R6
+            stxdw [r10-16], r7  ; save R7
+            ...
+  epilogue: ldxdw r6, [r10-8]   ; restore R6
+            ldxdw r7, [r10-16]  ; restore R7
+            exit
+```
+
+---
+
+## 35. sBPF Input Serialization — Exact Memory Layout
+
+At program entry, R1 = `0x400000000`. The serialized data layout for a transaction with one non-duplicate account:
+
+### Top-Level Structure
+```
+Offset  Size    Content
+------  ----    -------
+0x00    8       Number of accounts (u64, little-endian)
+0x08    ...     Account array (see per-account layout below)
+...     8       Instruction data length (u64)
+...     N       Instruction data bytes
+...     32      Program ID (Pubkey)
+```
+
+### Per-Account Layout (non-duplicate, marker = 0xFF)
+```
+Offset  Size    Content
+------  ----    -------
++0      1       Duplicate marker: 0xFF = not duplicate
++1      1       is_signer: 0x01 = signer, 0x00 = not
++2      1       is_writable: 0x01 = writable, 0x00 = read-only
++3      1       executable: 0x01 = program, 0x00 = data
++4      4       padding (alignment)
++8      32      Account public key (Pubkey)
++40     32      Owner program public key (Pubkey)
++72     8       Lamports (u64, little-endian)
++80     8       Account data length (u64)
++88     N       Account data bytes
++88+N   10240   Reserved realloc space (always 10,240 bytes)
+...     ?       Alignment padding to 16-byte boundary
+...     8       Rent epoch (u64; 0xFFFFFFFFFFFFFFFF = rent-exempt)
+```
+
+### Duplicate Account Layout (8 bytes total)
+```
+Offset  Size    Content
+------  ----    -------
++0      1       Duplicate index (0-based index of the original account)
++1      7       Padding zeros
+```
+
+### Concrete Offsets (1 account, 0 data bytes)
+```
+R1 + 0x00  = account count (= 1)
+R1 + 0x08  = account[0] flags (dup=0xFF, signer, writable, executable, padding)
+R1 + 0x10  = account[0] pubkey (32 bytes)
+R1 + 0x30  = account[0] owner  (32 bytes)
+R1 + 0x50  = account[0] lamports (8 bytes)
+R1 + 0x58  = account[0] data_len (8 bytes, = 0 here)
+R1 + 0x60  = account[0] data start
+R1 + 0x60 to R1 + 0x2863 = 10,240 realloc padding
+R1 + 0x2864 = alignment padding (4 bytes)
+R1 + 0x2868 = rent_epoch (8 bytes, 0xFFFFFFFFFFFFFFFF)
+R1 + 0x2870 = instruction data length (8 bytes)
+R1 + 0x2878 = instruction data start
+```
+
+### Reading in sBPF Assembly
+```asm
+; Entry: R1 = 0x400000000
+; Read lamports of account[0]
+ldxdw r2, [r1 + 0x50]    ; r2 = lamports
+
+; Read instruction data length
+ldxdw r3, [r1 + 0x2870]  ; r3 = data_len
+
+; Read first byte of instruction data (Anchor discriminator byte 0)
+ldxb  r4, [r1 + 0x2878]  ; r4 = instruction_data[0]
+
+; Read pubkey (32 bytes = 4 × 8-byte loads)
+ldxdw r5, [r1 + 0x10]    ; pubkey bytes 0-7
+ldxdw r6, [r1 + 0x18]    ; pubkey bytes 8-15
+ldxdw r7, [r1 + 0x20]    ; pubkey bytes 16-23
+ldxdw r8, [r1 + 0x28]    ; pubkey bytes 24-31
+```
+
+---
+
+## 36. sBPF Logging Syscalls — Full Reference
+
+### All Five Logging Syscalls
+
+**1. `sol_log_` — UTF-8 string**
+```asm
+; R1 = pointer to UTF-8 string data
+; R2 = byte length of string
+; Cost: variable (based on message length)
+mov64 r1, <string_ptr>
+mov64 r2, <length>
+syscall sol_log_
+```
+
+**2. `sol_log_64_` — Five 64-bit integers as hex**
+```asm
+; R1–R5 = the five values to log
+; Output: "Program log: 0x<r1>, 0x<r2>, 0x<r3>, 0x<r4>, 0x<r5>"
+; Cost: 100 CU
+mov64 r1, 0   ; or any value
+mov64 r2, 0
+mov64 r3, 0
+mov64 r4, 0
+mov64 r5, <value_to_log>
+syscall sol_log_64_
+```
+
+**3. `sol_log_pubkey` — Base58 public key**
+```asm
+; R1 = pointer to 32-byte pubkey in memory
+; Output: "Program log: <base58_pubkey>"
+; Cost: 100 CU
+mov64 r1, <pubkey_ptr>
+syscall sol_log_pubkey
+```
+
+**4. `sol_log_compute_units_` — Remaining CU count**
+```asm
+; No arguments needed
+; Output: "Program consumption: <remaining> units remaining"
+; Cost: 100 CU (subtract 101 from output: 100 for syscall + 1 for the syscall instruction)
+syscall sol_log_compute_units_
+```
+
+**5. `sol_log_data` — Binary data as base64**
+```asm
+; R1 = pointer to array of (pointer, length) slice descriptors
+; R2 = number of slice descriptors
+; Each descriptor is 16 bytes: [ptr: u64][len: u64]
+; Used for Anchor #[event] emission
+
+; Example: log data at address r3 with length r4
+stxdw [r10-16], r3    ; descriptor.ptr  = r3
+stxdw [r10-8],  r4    ; descriptor.len  = r4
+mov64 r1, r10
+add64 r1, -16          ; R1 points to descriptor
+mov64 r2, 1            ; 1 descriptor
+syscall sol_log_data
+```
+
+### Accessing Instruction Data for Logging
+The instruction data starts AFTER the accounts section. For a single-account transaction with no account data, the layout relative to R1 on entry is:
+```asm
+; Skip past 8-byte account count header
+; Skip past one full account record (variable size)
+; Then: 8-byte instruction data length, then data bytes
+
+; Shortcut for reading instruction data directly:
+mov64 r3, r1          ; save base pointer
+add64 r1, 0x2878      ; skip to instruction data (for 1 account, 0 data bytes)
+ldxdw r2, [r3+0x2870] ; load instruction data length
+syscall sol_log_       ; log the instruction data as UTF-8
+```
+
+---
+
+## 37. Native Rust — Complete Security Checklist
+
+The Wormhole bridge exploit ($320M) resulted from missing program ID verification. All seven checks are mandatory in native programs:
+
+```rust
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let config_account  = next_account_info(accounts_iter)?;
+    let user_account    = next_account_info(accounts_iter)?;
+    let admin_account   = next_account_info(accounts_iter)?;
+    let system_program  = next_account_info(accounts_iter)?;
+    let token_program   = next_account_info(accounts_iter)?;
+
+    // CHECK 1: Account ownership
+    // Prevents attacker from passing a crafted account that mimics your config
+    if config_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // CHECK 2: Known program ID verification (THE Wormhole omission)
+    // Prevents substituting a fake system/token program
+    if *system_program.key != solana_program::system_program::ID {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *token_program.key != spl_token::ID {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // CHECK 3: Signer — check BOTH key AND is_signer flag
+    // is_signer alone can be spoofed by a malicious program in CPI context
+    // key check alone doesn't verify the signature was actually provided
+    let expected_admin: Pubkey = config_account.data.borrow()[..32].try_into().unwrap();
+    if !admin_account.is_signer || *admin_account.key != expected_admin {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // CHECK 4: Writable accounts must be marked writable
+    if !user_account.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // CHECK 5: Reload account data after CPI (TOCTOU prevention)
+    some_cpi_call(accounts)?;
+    let fresh_data = user_account.try_borrow_data()?; // re-borrow, not cached
+
+    // CHECK 6: Burn dust before closing token accounts
+    // Attacker may deposit tiny amounts to prevent close_account
+    let token_balance = get_token_balance(user_token_account)?;
+    if token_balance > 0 {
+        burn_all_tokens(user_token_account, token_balance)?;
+    }
+    close_account(user_token_account, destination)?;
+
+    // CHECK 7: Handle frontrun on PDA creation
+    // If PDA already has lamports (frontrun), create_account fails
+    // Use transfer+allocate+assign instead:
+    if pda_account.lamports() > 0 {
+        // top up if needed
+        let needed = rent.minimum_balance(space).saturating_sub(pda_account.lamports());
+        if needed > 0 {
+            invoke(&system_instruction::transfer(payer.key, pda_account.key, needed), accounts)?;
+        }
+        invoke(&system_instruction::allocate(pda_account.key, space as u64), accounts)?;
+        invoke(&system_instruction::assign(pda_account.key, program_id), accounts)?;
+    } else {
+        invoke(&system_instruction::create_account(
+            payer.key, pda_account.key, lamports, space as u64, program_id
+        ), accounts)?;
+    }
+
+    Ok(())
+}
+```
