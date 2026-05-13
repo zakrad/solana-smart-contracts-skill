@@ -1,6 +1,10 @@
 ---
 name: solana-smart-contracts
-description: Complete framework for developing Solana smart contracts using Anchor and native Rust. Covers installation, Rust fundamentals, account model, PDAs, storage, SPL tokens, Token-2022 extensions, CPIs, security patterns, testing, and sBPF internals. Use when building, debugging, or auditing Solana programs.
+description: "Complete framework for developing Solana smart contracts using Anchor and native Rust. Covers installation, Rust fundamentals, account model, PDAs, storage, SPL tokens, Token-2022 extensions, CPIs, security patterns, testing, and sBPF internals. Use when building, debugging, or auditing Solana programs."
+license: MIT
+metadata:
+  author: zakrad
+  version: 1.0.0
 ---
 
 # Solana Smart Contract Development
