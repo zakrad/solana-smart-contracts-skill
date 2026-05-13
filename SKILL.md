@@ -4,7 +4,10 @@ description: "Complete framework for developing Solana smart contracts using Anc
 license: MIT
 metadata:
   author: zakrad
-  version: 1.0.0
+  version: "1.0.0"
+  organization: zakrad
+  date: May 2025
+  abstract: Comprehensive Solana smart contract development guide based on the RareSkills 60-Day Solana curriculum (https://rareskills.io/solana-tutorial). Covers 27 topic areas across 65 modules — installation, Rust fundamentals for Solidity developers, Solana account model, PDAs and storage, signers and access control, SOL transfers, sysvars, events, errors, CPIs, SPL tokens, Token-2022 extensions, Metaplex metadata, instruction introspection, Ed25519 signature verification, native Rust programs, Borsh serialization, security checks, testing with LiteSVM, Anchor constraints, sBPF internals, and Switchboard oracles. Includes complete code examples, pitfall tables, and EVM-to-Solana comparison.
 ---
 
 # Solana Smart Contract Development
